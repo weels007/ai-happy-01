@@ -250,16 +250,19 @@ function render(): void {
   glowShape(winCx, cb + 34, 170, 62, [255, 178, 96], 0.5, 2.2);
 
   // whale ----------------------------------------------------------------------
-  const WX = 430, WY = 368;
-  const WA = 0.12; // ~7 deg tilt, head down toward cottage
+  // WS scales the whole whale up so it dominates the frame (R1); WX/WY recentre it
+  // so the empty upper-right sky is filled rather than a vacant quarter.
+  const WX = 600, WY = 405, WS = 1.4, WA = 0.12; // ~7 deg tilt, head down toward cottage
   function localize(wx: number, wy: number): [number, number] {
     const dx = wx - WX, dy = wy - WY;
     const ca = Math.cos(WA), sa = Math.sin(WA);
-    return [dx * ca + dy * sa, -dx * sa + dy * ca];
+    const lx = dx * ca + dy * sa, ly = -dx * sa + dy * ca;
+    return [lx / WS, ly / WS];
   }
   function toWorld(lx: number, ly: number): [number, number] {
     const ca = Math.cos(WA), sa = Math.sin(WA);
-    return [WX + (lx * ca - ly * sa), WY + (lx * sa + ly * ca)];
+    const rx = lx * WS, ry = ly * WS;
+    return [WX + (rx * ca - ry * sa), WY + (rx * sa + ry * ca)];
   }
 
   function whaleSDF(x: number, y: number): number {
@@ -268,13 +271,13 @@ function render(): void {
     // body (long) + fuller head
     d = Math.min(d, ellipseDist(lx, ly, 0, 8, 150, 54, 0));
     d = Math.min(d, ellipseDist(lx, ly, 90, 22, 58, 52, 0.03));
-    // tail base taper blending body into peduncle, then into the fluke
-    d = Math.min(d, ellipseDist(lx, ly, -96, -2, 86, 50, 0));
-    d = Math.min(d, ellipseDist(lx, ly, -150, -2, 46, 26, 0));
-    // swept tail fluke: a forked pair of rounded lobes around a narrow peduncle
-    d = Math.min(d, ellipseDist(lx, ly, -178, -20, 30, 14, 0.2));
-    d = Math.min(d, ellipseDist(lx, ly, -178, 16, 30, 14, -0.2));
-    d = Math.min(d, ellipseDist(lx, ly, -154, -1, 16, 11, 0));
+    // tail base narrowing cleanly out of the body, then a thick peduncle
+    d = Math.min(d, ellipseDist(lx, ly, -110, -2, 95, 38, 0));
+    d = Math.min(d, ellipseDist(lx, ly, -205, -1, 80, 20, 0));
+    // fluke: a broad swept blade with a pointed tip, flaring well behind the body
+    // so the tail reads unmistakably as a whale's at small scale (R3)
+    d = Math.min(d, ellipseDist(lx, ly, -250, -36, 60, 36, 0.4));
+    d = Math.min(d, sdTriangle(lx, ly, -215, 6, -215, -78, -440, -140));
     // dorsal fin: small, low on the hind back, swept back toward the tail
     d = Math.min(d, ellipseDist(lx, ly, -70, -44, 15, 16, -0.7));
     // pectoral fin: long, thick, angled down-right so its solid tip reaches the lantern
@@ -296,21 +299,22 @@ function render(): void {
     return col;
   }
 
-  paintShape(190, 250, 660, 600, whaleSDF, (x, y, d) => whaleShade(x, y, d));
+  paintShape(140, 290, 850, 640, whaleSDF, (x, y, d) => whaleShade(x, y, d));
 
-  // eye: small dark eye on the forward (right) side of the head, above the smile, with a white catchlight
+  // eye: big, set low on the head below its midline so the forehead stays high (R2),
+  // with a large dark pupil and one bright catchlight
   {
-    const [ex, ey] = toWorld(100, 4);
-    const eyeX = ex, eyeY = ey, eyeR = 6.2;
-    paintShape(eyeX - eyeR - 1, eyeY - eyeR - 1, eyeX + eyeR + 1, eyeY + eyeR + 1,
-      (x, y) => hypot(x + 0.5 - eyeX, y + 0.5 - eyeY) - eyeR, () => [14, 11, 24]);
-    // single white catchlight, high up in the pupil
-    paintShape(eyeX - 2.4, eyeY - 2.7, eyeX + 2.4, eyeY + 1.3,
-      (x, y) => hypot(x + 0.5 - (eyeX - 0.4), y + 0.5 - (eyeY - 0.8)) - 1.9,
-      () => [250, 248, 255]);
+    const [ex, ey] = toWorld(98, 30);
+    const eyeX = ex, eyeY = ey, eyeR = 5.0 * WS; // world radius -> diameter ~9-10% of head height
+    paintShape(eyeX - eyeR - 2, eyeY - eyeR - 2, eyeX + eyeR + 2, eyeY + eyeR + 2,
+      (x, y) => hypot(x + 0.5 - eyeX, y + 0.5 - eyeY) - eyeR, () => [14, 11, 26]);
+    // single bright white catchlight, placed high toward the sky side of the pupil
+    paintShape(eyeX - eyeR * 0.7, eyeY - eyeR * 0.8, eyeX + eyeR * 0.5, eyeY + eyeR * 0.3,
+      (x, y) => hypot(x + 0.5 - (eyeX - eyeR * 0.15), y + 0.5 - (eyeY - eyeR * 0.25)) - eyeR * 0.4,
+      () => [255, 252, 255]);
   }
 
-  // gentle curved mouth line (thin quadratic-bezier stroke)
+  // gentle curved mouth line (thin quadratic-bezier stroke), scaled with the whale
   {
     const P0: [number, number] = [90, 40], P1: [number, number] = [116, 52], P2: [number, number] = [138, 40];
     const segs: Array<[number, number, number, number]> = [];
@@ -321,25 +325,28 @@ function render(): void {
         (1 - t) * (1 - t) * P0[1] + 2 * (1 - t) * t * P1[1] + t * t * P2[1],
       ];
       const a = bz(t0), b = bz(t1);
-      const ca = Math.cos(WA), sa = Math.sin(WA);
-      const wa: [number, number] = [WX + (a[0] * ca - a[1] * sa), WY + (a[0] * sa + a[1] * ca)];
-      const wb: [number, number] = [WX + (b[0] * ca - b[1] * sa), WY + (b[0] * sa + b[1] * ca)];
+      const wa = toWorld(a[0], a[1]);
+      const wb = toWorld(b[0], b[1]);
       segs.push([wa[0], wa[1], wb[0], wb[1]]);
     }
-    paintShape(460, 380, 560, 440,
+    paintShape(700, 458, 805, 505,
       (x, y) => {
         let best = Infinity;
         for (const s of segs) best = Math.min(best, segDist2(x, y, s[0], s[1], s[2], s[3]));
-        return Math.sqrt(best) - 1.3;
+        return Math.sqrt(best) - 1.5;
       },
       () => [30, 26, 48]);
   }
 
   // lantern cord + lantern -----------------------------------------------------
-  const lanX = 509, lanY = 521, lanR = 21;
-  // cord starts deep inside the pectoral fin's solid body (so it visibly leaves the whale),
+  const lanX = 707, lanY = 602, lanR = 22;
+  // cord starts inside the pectoral fin's scaled solid tip (so it visibly leaves the whale),
   // then drops to the top of the lantern
-  const cordA: [number, number] = [504, 468];
+  let cordA: [number, number] = [504, 468];
+  {
+    const fl = toWorld(50 + 74 * Math.sin(0.6), 40 + 74 * Math.cos(0.6));
+    cordA = [fl[0], fl[1] - 6];
+  }
   const cordB: [number, number] = [lanX, lanY - lanR + 4];
 
   // big warm halo of the lantern lighting the whale's underside + hills.
@@ -368,7 +375,7 @@ function render(): void {
   }
 
   // vignette: darken the corners, keep the eye on the lantern ------------------
-  const vxC = 560, vyC = 520, vR = 780;
+  const vxC = 690, vyC = 590, vR = 800;
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       const d = hypot(x - vxC, y - vyC) / vR;
