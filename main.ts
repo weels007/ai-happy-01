@@ -1,461 +1,441 @@
-// main.ts — ai-happy-01 entry.
-//
-// A whale drifts through the dusk sky and lowers one small lantern toward the
-// only lit window in the valley. The whole image is drawn here from arithmetic:
-// a dusk gradient, stars, two hill silhouettes, a cottage with a warm window,
-// the whale, and the lantern's halo. No assets, no network, no clock, and no
-// randomness that is not seeded: every run writes the same bytes.
-//
-// Node 22+, standard library only. Outside the grader:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// Make the AI judge happy — dusk scene: a whale flying through the evening sky,
+// lowering a paper lantern toward the only lit window in the valley.
+// Deterministic, no network, standard library only. Writes out/entry.png (RGB 1024x1024).
 
 import { deflateSync } from 'node:zlib';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 const W = 1024;
 const H = 1024;
 
-type RGB = [number, number, number];
-type Pt = [number, number];
+// ---------------------------------------------------------------------------
+// Deterministic PRNG (mulberry32)
+// ---------------------------------------------------------------------------
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
-const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
-const mix = (a: number, b: number, t: number): number => a + (b - a) * t;
-const mixc = (a: RGB, b: RGB, t: number): RGB => [
-  mix(a[0], b[0], t),
-  mix(a[1], b[1], t),
-  mix(a[2], b[2], t),
-];
-const smooth = (e0: number, e1: number, x: number): number => {
-  const t = clamp01((x - e0) / (e1 - e0));
+// ---------------------------------------------------------------------------
+// Small math helpers
+// ---------------------------------------------------------------------------
+function clamp(v: number, lo: number, hi: number): number { return v < lo ? lo : v > hi ? hi : v; }
+function lerp(a: number, b: number, t: number): number { return a + (b - a) * t; }
+function smoothstep(e0: number, e1: number, x: number): number {
+  const t = clamp((x - e0) / (e1 - e0), 0, 1);
   return t * t * (3 - 2 * t);
-};
-const hex = (s: string): RGB => [
-  parseInt(s.slice(1, 3), 16),
-  parseInt(s.slice(3, 5), 16),
-  parseInt(s.slice(5, 7), 16),
-];
+}
+function lerp3(c1: number[], c2: number[], t: number): number[] {
+  return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
+}
+function hypot(x: number, y: number): number { return Math.sqrt(x * x + y * y); }
 
-// ---------------------------------------------------------------- the canvas
-
-const buf = new Float32Array(W * H * 3);
-
-const inBounds = (x: number, y: number): boolean => x >= 0 && x < W && y >= 0 && y < H;
-
-const blendPx = (x: number, y: number, c: RGB, cov: number): void => {
-  if (cov <= 0 || !inBounds(x, y)) return;
+// Image (RGB)
+const img = new Uint8Array(W * H * 3);
+function setPix(x: number, y: number, c: number[]): void {
   const i = (y * W + x) * 3;
-  buf[i] = mix(buf[i], c[0], cov);
-  buf[i + 1] = mix(buf[i + 1], c[1], cov);
-  buf[i + 2] = mix(buf[i + 2], c[2], cov);
-};
+  img[i] = c[0]; img[i + 1] = c[1]; img[i + 2] = c[2];
+}
+function blendPix(x: number, y: number, c: number[], a: number): void {
+  const i = (y * W + x) * 3;
+  const ia = 1 - a;
+  img[i] = img[i] * ia + c[0] * a;
+  img[i + 1] = img[i + 1] * ia + c[1] * a;
+  img[i + 2] = img[i + 2] * ia + c[2] * a;
+}
 
-const addGlow = (
-  cx: number,
-  cy: number,
-  r: number,
-  c: RGB,
-  power: number,
-  gain: number,
-): void => {
-  const x0 = Math.max(0, Math.floor(cx - r));
-  const x1 = Math.min(W - 1, Math.ceil(cx + r));
-  const y0 = Math.max(0, Math.floor(cy - r));
-  const y1 = Math.min(H - 1, Math.ceil(cy + r));
+// SDF coverage: given signed distance d (negative inside), anti-aliased alpha.
+function cov(d: number): number { return smoothstep(-1, 1, -d); }
+
+// ---------------------------------------------------------------------------
+// Shape painting primitives
+// ---------------------------------------------------------------------------
+type SDF = (x: number, y: number) => number;
+type Shade = (x: number, y: number, d: number, a: number) => number[];
+
+function paintShape(bx0: number, by0: number, bx1: number, by1: number, sdf: SDF, shade: Shade): void {
+  const x0 = Math.max(0, Math.floor(bx0)), x1 = Math.min(W - 1, Math.ceil(bx1));
+  const y0 = Math.max(0, Math.floor(by0)), y1 = Math.min(H - 1, Math.ceil(by1));
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
-      const d = Math.hypot(x - cx, y - cy) / r;
+      const d = sdf(x + 0.5, y + 0.5);
+      const a = cov(d);
+      if (a <= 0.001) continue;
+      const c = shade(x, y, d, a);
+      if (a >= 0.999) setPix(x, y, c); else blendPix(x, y, c, a);
+    }
+  }
+}
+
+// Soft glow: additive-ish blend of a color with radial falloff.
+function glowShape(cx: number, cy: number, rx: number, ry: number, col: number[], maxA: number, expo: number): void {
+  const x0 = Math.max(0, Math.floor(cx - rx)), x1 = Math.min(W - 1, Math.ceil(cx + rx));
+  const y0 = Math.max(0, Math.floor(cy - ry)), y1 = Math.min(H - 1, Math.ceil(cy + ry));
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const d = hypot((x + 0.5 - cx) / rx, (y + 0.5 - cy) / ry);
       if (d >= 1) continue;
-      const a = Math.pow(1 - d, power) * gain;
-      const i = (y * W + x) * 3;
-      buf[i] += c[0] * a;
-      buf[i + 1] += c[1] * a;
-      buf[i + 2] += c[2] * a;
+      const a = maxA * Math.pow(1 - d, expo);
+      if (a > 0.002) blendPix(x, y, col, a);
     }
   }
-};
+}
 
-const stroke = (pts: Pt[], radius: number, c: RGB, alpha: number): void => {
-  let x0 = Infinity;
-  let x1 = -Infinity;
-  let y0 = Infinity;
-  let y1 = -Infinity;
-  for (const [px, py] of pts) {
-    x0 = Math.min(x0, px);
-    x1 = Math.max(x1, px);
-    y0 = Math.min(y0, py);
-    y1 = Math.max(y1, py);
-  }
-  const pad = radius + 2;
-  for (let y = Math.floor(y0 - pad); y <= Math.ceil(y1 + pad); y++) {
-    for (let x = Math.floor(x0 - pad); x <= Math.ceil(x1 + pad); x++) {
-      let d = Infinity;
-      for (let i = 0; i < pts.length - 1; i++) {
-        const ax = pts[i][0];
-        const ay = pts[i][1];
-        const bx = pts[i + 1][0];
-        const by = pts[i + 1][1];
-        const vx = bx - ax;
-        const vy = by - ay;
-        const t = clamp01(((x - ax) * vx + (y - ay) * vy) / (vx * vx + vy * vy || 1));
-        d = Math.min(d, Math.hypot(x - (ax + vx * t), y - (ay + vy * t)));
-      }
-      const cov = smooth(radius + 0.9, radius - 0.9, d) * alpha;
-      blendPx(x, y, c, cov);
-    }
-  }
-};
+// Ellipse SDF (axis-aligned in the local frame then rotated by `ang`), returns a
+// signed distance measured in pixels.
+function ellipseDist(px: number, py: number, cx: number, cy: number, rx: number, ry: number, ang: number): number {
+  const dx = px - cx, dy = py - cy;
+  const ca = Math.cos(ang), sa = Math.sin(ang);
+  const qx = dx * ca + dy * sa;
+  const qy = -dx * sa + dy * ca;
+  const l = hypot(qx / rx, qy / ry);
+  return (l - 1) * Math.min(rx, ry);
+}
 
-// ------------------------------------------------------------------- the sky
+// Box SDF
+function sdBox(px: number, py: number, cx: number, cy: number, hw: number, hh: number): number {
+  const dx = Math.abs(px - cx) - hw, dy = Math.abs(py - cy) - hh;
+  const ox = Math.max(dx, 0), oy = Math.max(dy, 0);
+  return hypot(ox, oy) + Math.min(Math.max(dx, dy), 0);
+}
 
-const HORIZON = 812;
+function segDist2(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+  const abx = bx - ax, aby = by - ay;
+  const L2 = abx * abx + aby * aby;
+  const tt = L2 > 0 ? clamp(((px - ax) * abx + (py - ay) * aby) / L2, 0, 1) : 0;
+  const ex = px - (ax + abx * tt), ey = py - (ay + aby * tt);
+  return ex * ex + ey * ey;
+}
 
-const skyAt = (y: number): RGB => {
-  const t = clamp01(y / HORIZON);
-  const stops: Array<[number, RGB]> = [
-    [0.0, hex('#070b1e')],
-    [0.3, hex('#121434')],
-    [0.55, hex('#2a2352')],
-    [0.74, hex('#5b3a5f')],
-    [0.87, hex('#a95e55')],
-    [1.0, hex('#e79a63')],
+// Triangle SDF: negative inside regardless of winding.
+function sdTriangle(px: number, py: number, ax: number, ay: number, bx: number, by: number, cx: number, cy: number): number {
+  const d0 = segDist2(px, py, ax, ay, bx, by);
+  const d1 = segDist2(px, py, bx, by, cx, cy);
+  const d2 = segDist2(px, py, cx, cy, ax, ay);
+  const un = Math.sqrt(Math.min(d0, Math.min(d1, d2)));
+  const c0 = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+  const c1 = (cx - bx) * (py - by) - (cy - by) * (px - bx);
+  const c2 = (ax - cx) * (py - cy) - (ay - cy) * (px - cx);
+  const inside = (c0 >= 0 && c1 >= 0 && c2 >= 0) || (c0 <= 0 && c1 <= 0 && c2 <= 0);
+  return inside ? -un : un;
+}
+
+// ---------------------------------------------------------------------------
+// Scene construction
+// ---------------------------------------------------------------------------
+
+// 1. Sky + sun glow ----------------------------------------------------------
+function skyColor(x: number, y: number): number[] {
+  // vertical gradient stops
+  const stops: Array<[number, number[]]> = [
+    [0, [7, 11, 30]],
+    [360, [42, 35, 82]],
+    [800, [148, 84, 80]],
+    [880, [231, 154, 99]],
   ];
+  let col: number[] = stops[0][1];
   for (let i = 0; i < stops.length - 1; i++) {
-    const [p0, c0] = stops[i];
-    const [p1, c1] = stops[i + 1];
-    if (t <= p1) return mixc(c0, c1, smooth(p0, p1, t));
+    const [y0, c0] = stops[i], [y1, c1] = stops[i + 1];
+    if (y <= y1) { col = lerp3(c0, c1, (y - y0) / (y1 - y0)); break; }
+    if (i === stops.length - 2) col = c1;
   }
-  return stops[stops.length - 1][1];
-};
-
-for (let y = 0; y < H; y++) {
-  const base = skyAt(y);
-  for (let x = 0; x < W; x++) blendPx(x, y, base, 1);
+  // warm last-sun glow, low and slightly right of centre
+  const gx = 640, gy = 690, gr = 420;
+  const d = hypot(x - gx, y - gy) / gr;
+  const ga = Math.pow(1 - clamp(d, 0, 1), 2.6);
+  col = lerp3(col, [255, 156, 82], ga * 0.92);
+  return col;
 }
 
-// the last of the sun, low behind the hills on the right
-addGlow(742, 806, 560, hex('#ff9c52'), 2.1, 0.5);
-addGlow(742, 812, 240, hex('#ffd08a'), 2.4, 0.4);
-
-// ------------------------------------------------------------------- stars
-
-let seed = 20261114;
-const rnd = (): number => {
-  seed = (seed * 1664525 + 1013904223) >>> 0;
-  return seed / 4294967296;
-};
-
-for (let i = 0; i < 190; i++) {
-  const x = rnd() * W;
-  const y = rnd() * 560;
-  const fade = 1 - smooth(300, 620, y);
-  if (fade <= 0.02) continue;
-  const r = 0.7 + rnd() * 1.5;
-  const bright = (0.35 + rnd() * 0.65) * fade;
-  addGlow(x, y, r * 5, hex('#dfe8ff'), 2.2, bright * 0.9);
-  addGlow(x, y, r * 1.8, hex('#ffffff'), 2.6, bright * 0.7);
+// 2. Hills (drawn later, but define height functions) -------------------------
+const HORIZON = 815;
+function farTop(x: number): number {
+  return 800 + 16 * Math.sin(x * 0.0045) + 11 * Math.sin(x * 0.0016 + 1.3) + 6 * Math.sin(x * 0.011 + 0.6);
+}
+function nearTop(x: number): number {
+  return 858 + 24 * Math.sin(x * 0.0038 + 2.0) + 17 * Math.sin(x * 0.015 + 0.4);
 }
 
-// ------------------------------------------------------------------- hills
+// Hill rendering helper
+function paintHill(weight: 'far' | 'near'): void {
+  const top = weight === 'far' ? farTop : nearTop;
+  const base: number[] = weight === 'far' ? [43, 35, 80] : [16, 12, 31];
+  paintShape(-10, 620, W + 10, H + 10,
+    // sdf negative inside the hill (below its top silhouette)
+    (x, y) => top(x) - y,
+    (x, y, d) => {
+      // warm light catching the crest: distance below the top is -d
+      const depth = Math.max(0, -d);
+      const rim = weight === 'far'
+        ? Math.exp(-depth / 26) * 0.55
+        : Math.exp(-depth / 34) * 0.16;
+      return lerp3(base, [235, 178, 128], clamp(rim, 0, 1));
+    });
+}
 
-const farHill = (x: number): number =>
-  748 + 22 * Math.sin(x / 253 + 0.4) + 11 * Math.sin(x / 91 + 2.2);
-
-const nearHill = (x: number): number =>
-  832 + 20 * Math.sin(x / 337 + 2.05) + 9 * Math.sin(x / 127 + 0.7);
-
-for (let x = 0; x < W; x++) {
-  const top = farHill(x);
-  for (let y = Math.max(0, Math.floor(top) - 1); y < H; y++) {
-    const cov = smooth(-0.9, 0.9, y - top);
-    if (cov <= 0) continue;
-    const lit = smooth(60, 0, y - top) * 0.35;
-    blendPx(x, y, mixc(hex('#2b2350'), hex('#6b3a52'), lit), cov);
+// 3. Procedure: paint everything -------------------------------------------
+function render(): void {
+  // sky
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) setPix(x, y, skyColor(x, y));
   }
-}
 
-for (let x = 0; x < W; x++) {
-  const top = nearHill(x);
-  for (let y = Math.max(0, Math.floor(top) - 1); y < H; y++) {
-    const cov = smooth(-0.9, 0.9, y - top);
-    if (cov <= 0) continue;
-    blendPx(x, y, hex('#100c1f'), cov);
+  // stars (upper sky, seeded, fading toward horizon)
+  const rng = mulberry32(0x9E3779B9);
+  const stars: Array<[number, number, number, number[]]> = [];
+  for (let i = 0; i < 190; i++) {
+    const x = rng() * W;
+    const y = 15 + Math.pow(rng(), 0.8) * 650;
+    const r = 0.5 + rng() * rng() * 1.6;
+    const pick = rng();
+    const col = pick < 0.7 ? [255, 255, 255] : pick < 0.85 ? [200, 215, 255] : [255, 218, 200];
+    stars.push([x, y, r, col]);
   }
-}
+  // sort by y so lower stars render on top (irrelevant, but deterministic)
+  stars.sort((a, b) => a[1] - b[1]);
+  for (const [sx, sy, r, col] of stars) {
+    const fade = clamp(1 - sy / 760, 0, 1);
+    glowShape(sx, sy, r * 3.2, r * 3.2, col, 0.9 * fade, 2.2);
+  }
 
-// ------------------------------------------------------------------ cottage
+  // sun glow (behind hills) already baked into sky; reinforce a broad warm pool
+  glowShape(600, 760, 480, 190, [255, 156, 82], 0.35, 2.8);
 
-const HOUSE_X = 800;
-const HOUSE_BASE = nearHill(HOUSE_X) + 6;
-const WALL_W = 120;
-const WALL_H = 76;
-const ROOF_H = 52;
-const HALF_BASE = WALL_W / 2 + 10;
-const wallTop = HOUSE_BASE - WALL_H;
-const roofApex = wallTop - ROOF_H;
+  // hills
+  paintHill('far');
+  paintHill('near');
 
-const WIN_W = 32;
-const WIN_H = 38;
-const WIN_X = HOUSE_X - WIN_W / 2;
-const WIN_Y = wallTop + 22;
+  // cottage on the near ridge -------------------------------------------------
+  const cb = nearTop(798); // base y of the cottage (bottom of walls)
+  const cxm = 798;
+  const wallTop = cb - 76;
+  const wL = cxm - 60, wR = cxm + 60;
+  const dark: number[] = [12, 9, 24];
 
-const sdRect = (
-  x: number,
-  y: number,
-  x0: number,
-  y0: number,
-  w: number,
-  h: number,
-): number => {
-  const dx = Math.max(x0 - x, x - (x0 + w));
-  const dy = Math.max(y0 - y, y - (y0 + h));
-  return Math.hypot(Math.max(dx, 0), Math.max(dy, 0)) + Math.min(Math.max(dx, dy), 0);
-};
+  // walls
+  paintShape(wL - 2, wallTop - 2, wR + 2, cb + 2,
+    (x, y) => sdBox(x, y, cxm, wallTop + 38, 60, 38),
+    () => dark);
 
-// walls and a proper gable roof: a triangle bounded by three half-planes
-{
-  const scale = ROOF_H / Math.hypot(HALF_BASE, ROOF_H);
+  // gable roof (solid filled triangle), overhangs walls a touch
+  const roofTip = wallTop - 52;
+  paintShape(wL - 16, roofTip - 4, wR + 16, wallTop + 2,
+    (x, y) => sdTriangle(x, y, wL - 14, wallTop, wR + 14, wallTop, cxm, roofTip),
+    () => [18, 14, 32]);
 
-  for (let y = Math.floor(roofApex) - 2; y < Math.ceil(HOUSE_BASE) + 2; y++) {
-    for (let x = HOUSE_X - HALF_BASE - 2; x < HOUSE_X + HALF_BASE + 2; x++) {
-      const roofApexD = roofApex - y; // inside when below the apex
-      const eaveD = y - wallTop; // inside when above the eaves
-      const wall = sdRect(x, y, HOUSE_X - WALL_W / 2, wallTop, WALL_W, WALL_H);
-      const sideD =
-        (Math.abs(x - HOUSE_X) - (HALF_BASE * (y - roofApex)) / ROOF_H) * scale;
-      const roof = Math.max(roofApexD, eaveD, sideD);
-      const d = Math.min(wall, roof);
-      blendPx(x, y, hex('#0c0918'), smooth(0.9, -0.9, d));
+  // window
+  const winCx = cxm + 8, winCy = wallTop + 37; // centre of window
+  const whw = 16, whh = 19;
+  paintShape(winCx - whw, winCy - whh, winCx + whw, winCy + whh,
+    (x, y) => sdBox(x, y, winCx, winCy, whw, whh),
+    (x, y) => lerp3([255, 190, 92], [255, 251, 230], (y - (winCy - whh)) / (2 * whh)));
+
+  // two thin vertical mullions + one horizontal
+  const mullCol: number[] = dark;
+  for (const mx of [winCx - 11, winCx + 5]) {
+    paintShape(mx - 1.2, winCy - whh, mx + 1.2, winCy + whh,
+      (x, y) => sdBox(x, y, mx, winCy, 1.2, whh), () => mullCol);
+  }
+  paintShape(winCx - whw, winCy - 1.2, winCx + whw, winCy + 1.2,
+    (x, y) => sdBox(x, y, winCx, winCy, whw, 1.2), () => mullCol);
+
+  // warm glow pooling on the grass below
+  glowShape(winCx, cb + 34, 170, 62, [255, 178, 96], 0.5, 2.2);
+
+  // whale ----------------------------------------------------------------------
+  const WX = 430, WY = 368;
+  const WA = 0.12; // ~7 deg tilt, head down toward cottage
+  function localize(wx: number, wy: number): [number, number] {
+    const dx = wx - WX, dy = wy - WY;
+    const ca = Math.cos(WA), sa = Math.sin(WA);
+    return [dx * ca + dy * sa, -dx * sa + dy * ca];
+  }
+  function toWorld(lx: number, ly: number): [number, number] {
+    const ca = Math.cos(WA), sa = Math.sin(WA);
+    return [WX + (lx * ca - ly * sa), WY + (lx * sa + ly * ca)];
+  }
+
+  function whaleSDF(x: number, y: number): number {
+    const [lx, ly] = localize(x, y);
+    let d = Infinity;
+    // body (long) + fuller head
+    d = Math.min(d, ellipseDist(lx, ly, 0, 8, 150, 54, 0));
+    d = Math.min(d, ellipseDist(lx, ly, 90, 22, 58, 52, 0.03));
+    // tail base taper blending body into peduncle, then into the fluke
+    d = Math.min(d, ellipseDist(lx, ly, -96, -2, 86, 50, 0));
+    d = Math.min(d, ellipseDist(lx, ly, -150, -2, 46, 26, 0));
+    // swept tail fluke: a forked pair of rounded lobes around a narrow peduncle
+    d = Math.min(d, ellipseDist(lx, ly, -178, -20, 30, 14, 0.2));
+    d = Math.min(d, ellipseDist(lx, ly, -178, 16, 30, 14, -0.2));
+    d = Math.min(d, ellipseDist(lx, ly, -154, -1, 16, 11, 0));
+    // dorsal fin: small, low on the hind back, swept back toward the tail
+    d = Math.min(d, ellipseDist(lx, ly, -70, -44, 15, 16, -0.7));
+    // pectoral fin: long, thick, angled down-right so its solid tip reaches the lantern
+    // and the cord visibly leaves the whale's silhouette
+    d = Math.min(d, ellipseDist(lx, ly, 50, 40, 19, 74, -0.6));
+    return d;
+  }
+
+  function whaleShade(x: number, y: number, d: number): number[] {
+    const [lx, ly] = localize(x, y);
+    const n = clamp(ly / 58, -1, 1);
+    let col = lerp3([149, 170, 230], [78, 91, 147], (n + 1) / 2); // periwinkle top -> deeper below
+    // pale belly
+    col = lerp3(col, [207, 218, 248], smoothstep(0.1, 0.7, n) * 0.75);
+    // warm rim light on the lower-right side facing the lantern
+    const lowerR = smoothstep(0, 55, ly) * smoothstep(-40, 80, lx);
+    const edgeNear = Math.exp(-Math.max(0, -d) / 18);
+    col = lerp3(col, [255, 194, 130], lowerR * edgeNear * 0.6);
+    return col;
+  }
+
+  paintShape(190, 250, 660, 600, whaleSDF, (x, y, d) => whaleShade(x, y, d));
+
+  // eye: small dark eye on the forward (right) side of the head, above the smile, with a white catchlight
+  {
+    const [ex, ey] = toWorld(100, 4);
+    const eyeX = ex, eyeY = ey, eyeR = 6.2;
+    paintShape(eyeX - eyeR - 1, eyeY - eyeR - 1, eyeX + eyeR + 1, eyeY + eyeR + 1,
+      (x, y) => hypot(x + 0.5 - eyeX, y + 0.5 - eyeY) - eyeR, () => [14, 11, 24]);
+    // single white catchlight, high up in the pupil
+    paintShape(eyeX - 2.4, eyeY - 2.7, eyeX + 2.4, eyeY + 1.3,
+      (x, y) => hypot(x + 0.5 - (eyeX - 0.4), y + 0.5 - (eyeY - 0.8)) - 1.9,
+      () => [250, 248, 255]);
+  }
+
+  // gentle curved mouth line (thin quadratic-bezier stroke)
+  {
+    const P0: [number, number] = [90, 40], P1: [number, number] = [116, 52], P2: [number, number] = [138, 40];
+    const segs: Array<[number, number, number, number]> = [];
+    for (let i = 0; i < 24; i++) {
+      const t0 = i / 24, t1 = (i + 1) / 24;
+      const bz = (t: number): [number, number] => [
+        (1 - t) * (1 - t) * P0[0] + 2 * (1 - t) * t * P1[0] + t * t * P2[0],
+        (1 - t) * (1 - t) * P0[1] + 2 * (1 - t) * t * P1[1] + t * t * P2[1],
+      ];
+      const a = bz(t0), b = bz(t1);
+      const ca = Math.cos(WA), sa = Math.sin(WA);
+      const wa: [number, number] = [WX + (a[0] * ca - a[1] * sa), WY + (a[0] * sa + a[1] * ca)];
+      const wb: [number, number] = [WX + (b[0] * ca - b[1] * sa), WY + (b[0] * sa + b[1] * ca)];
+      segs.push([wa[0], wa[1], wb[0], wb[1]]);
+    }
+    paintShape(460, 380, 560, 440,
+      (x, y) => {
+        let best = Infinity;
+        for (const s of segs) best = Math.min(best, segDist2(x, y, s[0], s[1], s[2], s[3]));
+        return Math.sqrt(best) - 1.3;
+      },
+      () => [30, 26, 48]);
+  }
+
+  // lantern cord + lantern -----------------------------------------------------
+  const lanX = 509, lanY = 521, lanR = 21;
+  // cord starts deep inside the pectoral fin's solid body (so it visibly leaves the whale),
+  // then drops to the top of the lantern
+  const cordA: [number, number] = [504, 468];
+  const cordB: [number, number] = [lanX, lanY - lanR + 4];
+
+  // big warm halo of the lantern lighting the whale's underside + hills.
+  // Drawn BEFORE the cord so the cord stays visible on top of the glow.
+  glowShape(lanX, lanY + 40, 230, 150, [255, 176, 104], 0.65, 2.0);
+
+  // lantern body: warm paper, bright core
+  paintShape(lanX - lanR - 2, lanY - lanR - 2, lanX + lanR + 2, lanY + lanR + 2,
+    (x, y) => hypot(x + 0.5 - lanX, y + 0.5 - lanY) - lanR,
+    (x, y) => {
+      const t = clamp(hypot(x - lanX, y - lanY) / lanR, 0, 1);
+      return lerp3([255, 251, 232], [255, 176, 79], Math.pow(t, 1.4));
+    });
+
+  // lantern cap + glow hotspot
+  paintShape(lanX - 8, lanY - lanR - 7, lanX + 8, lanY - lanR + 2,
+    (x, y) => sdBox(x, y, lanX, lanY - lanR - 2, 8, 5), () => [120, 66, 44]);
+  glowShape(lanX, lanY - 4, lanR * 2.4, lanR * 2.2, [255, 224, 170], 0.5, 2.0);
+
+  // cord: drawn last (on top of halo and lantern glow) so it stays a crisp dark
+  // line from inside the fin's body, down to the top of the lantern
+  {
+    const sdf = (x: number, y: number): number =>
+      Math.sqrt(segDist2(x, y, cordA[0], cordA[1], cordB[0], cordB[1])) - 1.5;
+    paintShape(cordA[0] - 4, cordA[1] - 3, cordB[0] + 4, cordB[1] + 3, sdf, () => [44, 40, 62]);
+  }
+
+  // vignette: darken the corners, keep the eye on the lantern ------------------
+  const vxC = 560, vyC = 520, vR = 780;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const d = hypot(x - vxC, y - vyC) / vR;
+      const f = 1 - 0.22 * smoothstep(0.4, 1.15, d);
+      const i = (y * W + x) * 3;
+      img[i] = img[i] * f; img[i + 1] = img[i + 1] * f; img[i + 2] = img[i + 2] * f;
     }
   }
 }
 
-// the warm light the window throws across the hillside
-addGlow(WIN_X + WIN_W / 2, WIN_Y + WIN_H / 2, 210, hex('#ffb155'), 2.6, 0.45);
-addGlow(WIN_X + WIN_W / 2, HOUSE_BASE + 26, 130, hex('#ff9f45'), 2.4, 0.32);
-
-// the window: a warm pane with mullions, drawn over the silhouette
-{
-  for (let y = WIN_Y - 3; y < WIN_Y + WIN_H + 3; y++) {
-    for (let x = WIN_X - 3; x < WIN_X + WIN_W + 3; x++) {
-      const d = sdRect(x, y, WIN_X, WIN_Y, WIN_W, WIN_H);
-      const cov = smooth(1.1, -1.1, d);
-      if (cov <= 0) continue;
-      const gx = (x - WIN_X) / WIN_W;
-      const gy = (y - WIN_Y) / WIN_H;
-      const warm = 1 - clamp01(Math.hypot(gx - 0.45, gy - 0.4) * 1.15);
-      const c = mixc(hex('#ffbe5c'), hex('#fffbe6'), Math.pow(clamp01(warm), 1.25) * 0.95);
-      blendPx(x, y, c, cov);
-      // mullions
-      const barH = Math.abs(y - (WIN_Y + WIN_H / 2)) < 1.4;
-      const barV = Math.abs(x - (WIN_X + WIN_W / 2)) < 1.4;
-      if (barH || barV) blendPx(x, y, hex('#7a4a1e'), cov * 0.55);
-    }
+// ---------------------------------------------------------------------------
+// PNG writer (RGB, color type 2)
+// ---------------------------------------------------------------------------
+let CRC_TABLE: Int32Array | null = null;
+function makeCrcTable(): Int32Array {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? (0xEDB88320 ^ (c >>> 1)) : c >>> 1;
+    t[n] = c;
   }
-  // the panes bleed a little light past their frame
-  addGlow(WIN_X + WIN_W / 2, WIN_Y + WIN_H / 2, 78, hex('#ffca7a'), 2.6, 0.22);
+  return t;
+}
+function crc32(buf: Buffer | Uint8Array, start: number, len: number): number {
+  if (!CRC_TABLE) CRC_TABLE = makeCrcTable();
+  let c = -1;
+  for (let i = 0; i < len; i++) c = (CRC_TABLE[(c ^ buf[start + i]) & 0xff] ^ (c >>> 8)) | 0;
+  return (c ^ -1) >>> 0;
+}
+function chunk(type: string, data: Buffer | Uint8Array | null): Buffer {
+  const len = data ? data.length : 0;
+  const buf = Buffer.alloc(8 + len + 4);
+  buf.writeUInt32BE(len, 0);
+  buf.write(type, 4, 'ascii');
+  if (data) Buffer.from(data).copy(buf, 8);
+  const crc = crc32(buf, 4, 4 + len);
+  buf.writeUInt32BE(crc, 8 + len);
+  return buf;
+}
+function buildPNG(): Buffer {
+  const stride = W * 3;
+  const raw = Buffer.alloc(H * (1 + stride));
+  for (let y = 0; y < H; y++) {
+    const ro = y * (1 + stride);
+    raw[ro] = 0; // filter: none
+    for (let x = 0; x < stride; x++) raw[ro + 1 + x] = img[y * stride + x];
+  }
+  const idat = deflateSync(raw, { level: 6 });
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0);
+  ihdr.writeUInt32BE(H, 4);
+  ihdr[8] = 8;   // bit depth
+  ihdr[9] = 2;   // colour type: RGB
+  ihdr[10] = 0;  // compression
+  ihdr[11] = 0;  // filter
+  ihdr[12] = 0;  // interlace
+  const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  return Buffer.concat([sig, chunk('IHDR', ihdr), chunk('IDAT', idat), chunk('IEND', null)]);
 }
 
-// -------------------------------------------------------------- the lantern
-
-const LANTERN_X = 552;
-const LANTERN_Y = 548;
-
-addGlow(LANTERN_X, LANTERN_Y, 340, hex('#ff9d4a'), 2.3, 0.4);
-addGlow(LANTERN_X, LANTERN_Y, 150, hex('#ffc978'), 2.5, 0.45);
-
-// ----------------------------------------------------------------- the whale
-
-const WHALE_A = (7 * Math.PI) / 180;
-const WHALE_X = 430;
-const WHALE_Y = 360;
-const COS_A = Math.cos(WHALE_A);
-const SIN_A = Math.sin(WHALE_A);
-
-const toCanvas = (lx: number, ly: number): Pt => [
-  WHALE_X + lx * COS_A - ly * SIN_A,
-  WHALE_Y + lx * SIN_A + ly * COS_A,
-];
-
-const sdEllipse = (
-  lx: number,
-  ly: number,
-  cx: number,
-  cy: number,
-  rx: number,
-  ry: number,
-  rot: number,
-): number => {
-  const c = Math.cos(-rot);
-  const s = Math.sin(-rot);
-  const dx = lx - cx;
-  const dy = ly - cy;
-  const px = dx * c - dy * s;
-  const py = dx * s + dy * c;
-  return (Math.hypot(px / rx, py / ry) - 1) * Math.min(rx, ry);
-};
-
-const smin = (a: number, b: number, k: number): number => {
-  const h = clamp01(0.5 + (0.5 * (b - a)) / k);
-  return mix(b, a, h) - k * h * (1 - h);
-};
-
-const whaleSdf = (lx: number, ly: number): number => {
-  // the body, fuller at the head where it leans toward the cottage
-  let d = smin(sdEllipse(lx, ly, 0, 0, 196, 88, 0), sdEllipse(lx, ly, 118, 14, 78, 78, 0), 40);
-  // the tail stock narrowing behind
-  d = smin(d, sdEllipse(lx, ly, -172, 10, 68, 36, 0.12), 44);
-  // one swept blade of a fluke, and a small lower one: a side-on whale tail
-  d = smin(d, sdEllipse(lx, ly, -226, -28, 66, 25, -0.44), 22);
-  d = smin(d, sdEllipse(lx, ly, -212, 32, 44, 17, 0.3), 22);
-  // the pectoral fin, reaching down toward the valley
-  d = smin(d, sdEllipse(lx, ly, 86, 96, 64, 22, 0.62), 18);
-  // a small dorsal fin
-  d = smin(d, sdEllipse(lx, ly, -46, -78, 34, 17, 0.34), 18);
-  return d;
-};
-
-{
-  for (let y = 120; y <= 640; y++) {
-    for (let x = 100; x <= 780; x++) {
-      const dx = x - WHALE_X;
-      const dy = y - WHALE_Y;
-      const lx = dx * COS_A + dy * SIN_A;
-      const ly = -dx * SIN_A + dy * COS_A;
-      const d = whaleSdf(lx, ly);
-      if (d > 2) continue;
-      const cov = smooth(1.2, -1.2, d);
-      if (cov <= 0) continue;
-
-      // dim sky above, deeper below, a pale belly, a warm rim from the lantern
-      const t = smooth(-84, 92, ly);
-      let c = mixc(hex('#95aae6'), hex('#4e5b93'), t);
-      c = mixc(c, hex('#cfdaf8'), smooth(6, 58, ly) * 0.72);
-      c = mixc(c, hex('#b9c9f6'), smooth(-140, -30, ly) * 0.3);
-
-      const dl = Math.hypot(x - LANTERN_X, y - LANTERN_Y);
-      c = mixc(c, hex('#ffcf8e'), Math.pow(clamp01(1 - dl / 320), 2.2) * 0.8);
-
-      blendPx(x, y, c, cov);
-    }
-  }
-}
-
-// the eye, its catchlight, and the crease of a patient smile
-{
-  const eye = toCanvas(152, -6);
-  for (let y = Math.floor(eye[1]) - 12; y <= Math.ceil(eye[1]) + 12; y++) {
-    for (let x = Math.floor(eye[0]) - 12; x <= Math.ceil(eye[0]) + 12; x++) {
-      const d = Math.hypot(x - eye[0], y - eye[1]) - 6.6;
-      blendPx(x, y, hex('#1b1633'), smooth(1.0, -1.0, d));
-    }
-  }
-  addGlow(eye[0] - 2.2, eye[1] - 2.4, 6, hex('#ffffff'), 2.0, 0.9);
-
-  const mouth: Pt[] = [];
-  for (let i = 0; i <= 22; i++) {
-    const t = i / 22;
-    const lx = mix(140, 190, t);
-    const ly = 34 + Math.sin(Math.PI * t) * 16;
-    mouth.push(toCanvas(lx, ly));
-  }
-  stroke(mouth, 2.1, hex('#2a2450'), 0.85);
-}
-
-// the cord and the lantern hanging from the fin's tip
-{
-  const tip = toCanvas(140, 138);
-  const pts: Pt[] = [];
-  for (let i = 0; i <= 12; i++) {
-    const t = i / 12;
-    pts.push([mix(tip[0], LANTERN_X, t), mix(tip[1], LANTERN_Y - 20, t)]);
-  }
-  stroke(pts, 1.6, hex('#241c3a'), 0.9);
-}
-
-{
-  for (let y = LANTERN_Y - 34; y <= LANTERN_Y + 30; y++) {
-    for (let x = LANTERN_X - 26; x <= LANTERN_X + 26; x++) {
-      const dBody = sdEllipse(x, y, LANTERN_X, LANTERN_Y, 15, 18, 0);
-      const dCap = sdRect(x, y, LANTERN_X - 10, LANTERN_Y - 26, 20, 7);
-      const dRing = sdRect(x, y, LANTERN_X - 8, LANTERN_Y + 15, 16, 5);
-      const d = Math.min(dBody, dCap, dRing);
-      const cov = smooth(1.0, -1.0, d);
-      if (cov <= 0) continue;
-      const glow = 1 - clamp01(Math.hypot(x - LANTERN_X, y - LANTERN_Y) / 23);
-      const c = mixc(hex('#ffb04f'), hex('#fffbe8'), Math.pow(glow, 1.3) * 0.95);
-      blendPx(x, y, c, cov);
-    }
-  }
-  addGlow(LANTERN_X, LANTERN_Y, 96, hex('#ffe7b4'), 2.4, 0.55);
-}
-
-// -------------------------------------------------------------------- finish
-
-for (let y = 0; y < H; y++) {
-  for (let x = 0; x < W; x++) {
-    const dx = (x - W / 2) / (W / 2);
-    const dy = (y - H / 2) / (H / 2);
-    const v = 1 - 0.28 * Math.pow(clamp01(Math.hypot(dx, dy) / 1.42), 2.2);
-    const i = (y * W + x) * 3;
-    buf[i] *= v;
-    buf[i + 1] *= v;
-    buf[i + 2] *= v;
-  }
-}
-
-// ------------------------------------------------------------------- the PNG
-
-const crcTable: number[] = [];
-for (let n = 0; n < 256; n++) {
-  let c = n;
-  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  crcTable[n] = c >>> 0;
-}
-
-const crc32 = (b: Buffer): number => {
-  let c = 0xffffffff;
-  for (let i = 0; i < b.length; i++) c = crcTable[(c ^ b[i]) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-};
-
-const chunk = (type: string, data: Buffer): Buffer => {
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(data.length, 0);
-  const t = Buffer.from(type, 'ascii');
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(Buffer.concat([t, data])), 0);
-  return Buffer.concat([len, t, data, crc]);
-};
-
-const raw = Buffer.alloc(H * (1 + W * 3));
-let o = 0;
-for (let y = 0; y < H; y++) {
-  raw[o++] = 0; // filter: none
-  for (let x = 0; x < W; x++) {
-    const i = (y * W + x) * 3;
-    raw[o++] = Math.round(clamp01(buf[i] / 255) * 255);
-    raw[o++] = Math.round(clamp01(buf[i + 1] / 255) * 255);
-    raw[o++] = Math.round(clamp01(buf[i + 2] / 255) * 255);
-  }
-}
-
-const ihdr = Buffer.alloc(13);
-ihdr.writeUInt32BE(W, 0);
-ihdr.writeUInt32BE(H, 4);
-ihdr[8] = 8; // bit depth
-ihdr[9] = 2; // colour type: truecolour
-ihdr[10] = 0;
-ihdr[11] = 0;
-ihdr[12] = 0;
-
-const png = Buffer.concat([
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-  chunk('IHDR', ihdr),
-  chunk('IDAT', deflateSync(raw, { level: 9 })),
-  chunk('IEND', Buffer.alloc(0)),
-]);
-
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+render();
 const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-mkdirSync(outDir, { recursive: true });
+const png = buildPNG();
 writeFileSync(join(outDir, 'entry.png'), png);
+const sha = createHash('sha256').update(png).digest('hex');
+console.log(`wrote ${png.length} bytes -> ${join(outDir, 'entry.png')}`);
+console.log(`sha256=${sha}`);
